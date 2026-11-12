@@ -32,7 +32,11 @@ export async function POST(req: NextRequest) {
           parts: [{ 
             text: `Act as an expert senior technical analyst and quantitative trader. Provide a concise, structured research breakdown for ${symbol || "market query"} regarding: ${query}. ${techContext} Structure the analysis clearly into: 1. Trend & Breakout Levels, 2. Indicator & Volume Confirmation, 3. Intraday Outlook & Triggers, and 4. Delivery / Swing Structure.` 
           }]
-        }]
+        }],
+        generationConfig: {
+          maxOutputTokens: 1024,
+          temperature: 0.7
+        }
       })
     });
 
