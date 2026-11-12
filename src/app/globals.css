@@ -1,0 +1,88 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 1. Aveon Dark (Original Terminal Dark - Default) */
+:root,
+[data-theme="aveon-dark"] {
+  --aveon-bg: 11 15 20;
+  --aveon-panel: 17 22 29;
+  --aveon-panel2: 22 28 37;
+  --aveon-border: 35 41 53;
+  --aveon-text: 226 232 240;
+  --aveon-muted: 138 148 163;
+  --aveon-primary: 47 107 255;
+  --aveon-accent: 244 163 0;
+  --aveon-buy: 22 163 74;
+  --aveon-sell: 220 38 38;
+}
+
+/* 2. Dark (Google Finance Matte Charcoal Dark) */
+[data-theme="dark"] {
+  --aveon-bg: 18 18 18;          /* #121212 - Deep matte charcoal canvas */
+  --aveon-panel: 30 30 30;       /* #1E1E1E - Soft elevated dark gray cards */
+  --aveon-panel2: 38 38 38;      /* #262626 - Secondary surface tone */
+  --aveon-border: 45 45 45;      /* Subtle dark border */
+  --aveon-text: 243 244 246;     /* #F3F4F6 - Soft off-white text */
+  --aveon-muted: 156 163 175;    /* #9CA3AF - Muted gray labels */
+  --aveon-primary: 59 130 246;   /* #3B82F6 - Bright blue accent */
+  --aveon-accent: 99 102 241;
+  --aveon-buy: 16 185 129;       /* Emerald green */
+  --aveon-sell: 239 68 68;       /* Crisp red */
+}
+
+/* 3. Lite (Google Finance / PhonePe Light) */
+[data-theme="lite"] {
+  --aveon-bg: 248 249 250;       /* #F8F9FA - Airy, ultra-light neutral canvas */
+  --aveon-panel: 255 255 255;    /* #FFFFFF - Pure white cards */
+  --aveon-panel2: 243 244 246;   /* #F3F4F6 - Soft elevated background */
+  --aveon-border: 229 231 235;   /* #E5E7EB - Clean, subtle light borders */
+  --aveon-text: 17 24 39;        /* #111827 - Razor-sharp dark text */
+  --aveon-muted: 107 114 128;    /* #6B7280 - Balanced secondary gray */
+  --aveon-primary: 37 99 235;    /* #2563EB - Clean financial blue accent */
+  --aveon-accent: 79 70 229;
+  --aveon-buy: 16 185 129;       /* #10B981 - Clean emerald green */
+  --aveon-sell: 239 68 68;       /* #EF4444 - Crisp red */
+}
+
+html,
+body {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  background-color: rgb(var(--aveon-bg));
+  color: rgb(var(--aveon-text));
+  font-weight: 500;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-variant-numeric: tabular-nums;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--aveon-border));
+  border-radius: 8px;
+}
+
+.card {
+  background-color: rgb(var(--aveon-panel));
+  border: 1px solid rgb(var(--aveon-border));
+  border-radius: 12px;
+}
+
+[data-theme="lite"] .card {
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.05);
+}
+
+.table-row-hover:hover {
+  background-color: rgb(var(--aveon-panel2));
+}

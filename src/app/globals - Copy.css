@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Dark theme (default) */
+:root,
+[data-theme="dark"] {
+  --aveon-bg: 11 15 20;
+  --aveon-panel: 17 22 29;
+  --aveon-panel2: 22 28 37;
+  --aveon-border: 35 41 53;
+  --aveon-text: 226 232 240;
+  --aveon-muted: 138 148 163;
+  --aveon-primary: 47 107 255;
+  --aveon-accent: 244 163 0;
+  --aveon-buy: 22 163 74;
+  --aveon-sell: 220 38 38;
+}
+
+/* Light theme — clean, Robinhood-inspired: white surfaces, soft borders,
+   a single confident accent color, generous whitespace. */
+[data-theme="light"] {
+  --aveon-bg: 255 255 255;
+  --aveon-panel: 255 255 255;
+  --aveon-panel2: 247 248 250;
+  --aveon-border: 225 227 231;
+  --aveon-text: 10 14 23;
+  --aveon-muted: 71 85 105;
+  --aveon-primary: 37 99 235;
+  --aveon-accent: 217 119 6;
+  --aveon-buy: 0 168 5;
+  --aveon-sell: 214 33 33;
+}
+
+html,
+body {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  background-color: rgb(var(--aveon-bg));
+  color: rgb(var(--aveon-text));
+  font-weight: 500;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-variant-numeric: tabular-nums;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--aveon-border));
+  border-radius: 8px;
+}
+
+.card {
+  background-color: rgb(var(--aveon-panel));
+  border: 1px solid rgb(var(--aveon-border));
+  border-radius: 12px;
+}
+
+[data-theme="light"] .card {
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.04);
+}
+
+.table-row-hover:hover {
+  background-color: rgb(var(--aveon-panel2));
+}
