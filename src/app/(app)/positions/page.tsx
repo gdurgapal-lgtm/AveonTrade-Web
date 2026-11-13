@@ -12,7 +12,7 @@ import { invalidateShared } from "@/lib/sharedFetch";
 import { positionsPath, Endpoints } from "@/lib/endpoints";
 import { formatCurrency, pnlTone } from "@/lib/format";
 import { feedToken, displayProductType, positionDisplaySymbol, validityToApi, type Instrument, type PositionModel } from "@/types/trading";
-import { positionToInstrument } from "@/lib/positionHelpers";
+import { positionToInstrument, positionMtm } from "@/lib/positionHelpers";
 import { getLastMarketQuote } from "@/lib/marketQuoteCache";
 
 export default function PositionsPage() {
@@ -27,6 +27,11 @@ export default function PositionsPage() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [squareAllOpen, setSquareAllOpen] = useState(false);
+  const [selectedPositionKeys, setSelectedPositionKeys] = useState<Set<string>>(() => new Set());
+  const [closeSelectedOpen, setCloseSelectedOpen] = useState(false);
+  const [closeSelectedOrderType, setCloseSelectedOrderType] = useState<"RL-MKT" | "RL">("RL-MKT");
+  const [closeSelectedValidity, setCloseSelectedValidity] = useState<"DAY" | "IOC">("DAY");
+  const [closeSelectedPrices, setCloseSelectedPrices] = useState<Record<string, string>>({});
 
   const raw = usePolledData<Record<string, any>[]>(positionsPath(view, 1), 5_000, true, LIVE_POSITIONS);
   const positions = useMemo(() => (raw.data ?? []).map(normalizePositionWeb), [raw.data]);
@@ -47,7 +52,8 @@ export default function PositionsPage() {
     const avg = p.net_quantity >= 0 ? p.avg_buy_price : p.avg_sell_price;
     // Cached prices are displayed for reference only; never use them to calculate live P&L.
     const livePnl = liveLtp > 0 ? (liveLtp - (p.net_price || avg)) * p.net_quantity * (p.multiplier || 1) : 0;
-    return { p, ltp, livePnl, hasLive: liveLtp > 0, cachedAt: cached?.receivedAt ?? null };
+    const mtm = positionMtm(p, liveLtp);
+    return { p, ltp, livePnl, mtm, hasLive: liveLtp > 0, cachedAt: cached?.receivedAt ?? null, selectionKey: positionSelectionKey(p) };
   });
 
   function openAction(kind: "increase" | "close" | "convert", p: PositionModel) {
@@ -168,6 +174,92 @@ export default function PositionsPage() {
     if (res.success) raw.reload();
   }
 
+  const selectableRows = rows.filter((r) => r.p.net_quantity !== 0);
+  const selectedRows = selectableRows.filter((r) => selectedPositionKeys.has(r.selectionKey));
+
+  function togglePositionSelection(key: string, checked: boolean) {
+    setSelectedPositionKeys((current) => {
+      const next = new Set(current);
+      if (checked) next.add(key); else next.delete(key);
+      return next;
+    });
+  }
+
+  function toggleAllPositions(checked: boolean) {
+    setSelectedPositionKeys(checked ? new Set(selectableRows.map((r) => r.selectionKey)) : new Set());
+  }
+
+  async function closeSelectedPositions() {
+    // Build one broker bulk-order request from the exact positions selected in the table.
+    const targets = selectedRows.filter((r) => r.p.net_quantity !== 0);
+    if (!targets.length) return;
+    if (closeSelectedOrderType === "RL") {
+      const invalid = targets.find(({ p }) => !(Number(closeSelectedPrices[positionSelectionKey(p)]) > 0));
+      if (invalid) {
+        setMessage(`Enter a valid limit price for ${positionDisplaySymbol(invalid.p)}.`);
+        return;
+      }
+    }
+
+    setBusy(true);
+    setMessage(`Preparing ${targets.length} selected closing order(s)…`);
+    try {
+      const bulkOrders = targets.map(({ p }) => {
+        const exchange = String(p.preferred_exchange || p.exchange || "").trim();
+        const token = Number(p.preferred_scrip_token ?? p.scrip_token);
+        if (!exchange || !Number.isFinite(token) || token <= 0) {
+          throw new Error(`${positionDisplaySymbol(p)}: exchange or instrument token is unavailable.`);
+        }
+
+        const quantity = Math.abs(Number(p.net_quantity));
+        if (!Number.isFinite(quantity) || quantity <= 0) {
+          throw new Error(`${positionDisplaySymbol(p)}: invalid net quantity.`);
+        }
+
+        return {
+          scrip_info: {
+            exchange,
+            scrip_token: token,
+            symbol: p.symbol || "",
+            series: p.series || "",
+            expiry_date: p.expiry_date || "",
+            strike_price: p.strike_price || "0.00",
+            option_type: p.option_type || "",
+          },
+          transaction_type: p.net_quantity > 0 ? "SELL" : "BUY",
+          // Preserve the product type reported for this position (e.g. DELIVERY).
+          product_type: String(p.product_type || "").trim().toUpperCase(),
+          order_type: closeSelectedOrderType,
+          quantity,
+          // Limit prices are configured per symbol because one price cannot safely
+          // be shared across different instruments. Market orders send zero.
+          price: closeSelectedOrderType === "RL" ? Number(closeSelectedPrices[positionSelectionKey(p)]).toFixed(2) : "0.00",
+          trigger_price: 0,
+          disclosed_quantity: 0,
+          validity: validityToApi(closeSelectedValidity, exchange),
+          is_amo: false,
+          order_identifier: "",
+        };
+      });
+
+      const response = await apiClient.post(Endpoints.orders.bulk, bulkOrders);
+      if (!response.success) {
+        throw new Error(response.message || "Broker rejected the bulk close request.");
+      }
+
+      setMessage(response.message || `Bulk close request submitted for ${bulkOrders.length} selected position(s). Check Order Book for individual order status.`);
+      setSelectedPositionKeys(new Set());
+      setCloseSelectedOpen(false);
+      raw.reload();
+      invalidateShared(positionsPath(view, 1));
+      invalidateShared(Endpoints.positions.list);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Bulk close request failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const totals = rows.reduce((a, r) => ({ value: a.value + r.p.net_value, livePnl: a.livePnl + r.livePnl }), { value: 0, livePnl: 0 });
 
   return (
@@ -175,15 +267,15 @@ export default function PositionsPage() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-semibold">Positions</h1>
-          <p className="text-xs text-aveon-muted">Mobile-parity position actions with live market-price join.</p>
+          <p className="text-xs text-aveon-muted"></p>
         </div>
-        <Button variant="sell" disabled={busy || !positions.some((p) => p.net_quantity !== 0)} onClick={() => setSquareAllOpen(true)}>Square Off All</Button>
+        <div className="flex flex-wrap gap-2"><Button variant="ghost" disabled={busy || selectedRows.length === 0} onClick={() => { setCloseSelectedOrderType("RL-MKT"); setCloseSelectedValidity("DAY"); setCloseSelectedPrices(Object.fromEntries(selectedRows.map(({ p, ltp, selectionKey }) => [selectionKey, ltp > 0 ? Number(ltp).toFixed(2) : ""]))); setMessage(""); setCloseSelectedOpen(true); }}>Close Selected ({selectedRows.length})</Button><Button variant="sell" disabled={busy || !positions.some((p) => p.net_quantity !== 0)} onClick={() => setSquareAllOpen(true)}>Square Off All</Button></div>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex rounded-lg border border-aveon-border p-1">
           {([['daily', 'Today'], ['expiry', 'Expiry']] as const).map(([v, l]) => (
-            <button key={v} onClick={() => setView(v)} className={`rounded-md px-3 py-1.5 text-xs ${view === v ? 'bg-aveon-primary text-white' : 'text-aveon-muted'}`}>{l}</button>
+            <button key={v} onClick={() => { setView(v); setSelectedPositionKeys(new Set()); }} className={`rounded-md px-3 py-1.5 text-xs ${view === v ? 'bg-aveon-primary text-white' : 'text-aveon-muted'}`}>{l}</button>
           ))}
         </div>
         <div className="flex gap-5 text-xs">
@@ -202,19 +294,21 @@ export default function PositionsPage() {
         ) : !rows.length ? (
           <EmptyState title="No open positions" />
         ) : (
-          <table className="w-full min-w-[1050px] text-xs">
+          <table className="w-full min-w-[1500px] text-xs">
             <thead className="border-b border-aveon-border text-left text-aveon-muted">
               <tr>
-                {['Symbol', 'Product', 'Net Qty', 'Net Price', 'LTP', 'Net Value', 'Action'].map((h) => (
+                <th className="px-3 py-2 font-medium"><input type="checkbox" aria-label="Select all open positions" checked={selectableRows.length > 0 && selectedRows.length === selectableRows.length} onChange={(e) => toggleAllPositions(e.target.checked)} /></th>
+                {['Symbol', 'Product', 'Net Qty', 'Net Price', 'Net Value', 'LTP', 'MTM G/L', 'Buy Qty', 'Buy Price', 'Sell Qty', 'Sell Price', 'Action'].map((h) => (
                   <th key={h} className="px-3 py-2 font-medium">{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {rows.map(({ p, ltp, hasLive, cachedAt }, i) => {
+              {rows.map(({ p, ltp, mtm, hasLive, cachedAt, selectionKey }, i) => {
                 const isZero = p.net_quantity === 0;
                 return (
-                  <tr key={`${p.exchange}-${p.scrip_token}-${p.product_type}-${i}`} className="table-row-hover border-b border-aveon-border/40">
+                  <tr key={`${p.exchange}-${p.scrip_token}-${p.product_type}-${p.daily_or_expiry || ""}-${i}`} className="table-row-hover border-b border-aveon-border/40">
+                    <td className="px-3 py-2"><input type="checkbox" aria-label={`Select ${positionDisplaySymbol(p)}`} disabled={isZero} checked={selectedPositionKeys.has(selectionKey)} onChange={(e) => togglePositionSelection(selectionKey, e.target.checked)} /></td>
                     <td className="px-3 py-2">
                       <p className="font-medium">{positionDisplaySymbol(p)}</p>
                       <p className="text-[10px] text-aveon-muted">{p.preferred_exchange || p.exchange}</p>
@@ -222,6 +316,7 @@ export default function PositionsPage() {
                     <td className="px-3 py-2">{displayProductType(p.product_type, p.preferred_exchange || p.exchange, p.instrument)}</td>
                     <td className="px-3 py-2 font-semibold">{p.net_quantity}</td>
                     <td className="px-3 py-2">{formatCurrency(p.net_price || (p.net_quantity >= 0 ? p.avg_buy_price : p.avg_sell_price))}</td>
+                    <td className="px-3 py-2"><Badge tone={pnlTone(p.net_value)}>{formatCurrency(p.net_value)}</Badge></td>
                     <td className="px-3 py-2">
                       {ltp > 0 ? (
                         <span title={hasLive ? "Live market price" : `Last received market price: ${new Date(cachedAt ?? 0).toLocaleString()}`} className={hasLive ? "text-aveon-text" : "text-aveon-muted"}>
@@ -229,7 +324,11 @@ export default function PositionsPage() {
                         </span>
                       ) : "—"}
                     </td>
-                    <td className="px-3 py-2"><Badge tone={pnlTone(p.net_value)}>{formatCurrency(p.net_value)}</Badge></td>
+                    <td className="px-3 py-2">{mtm === null ? "—" : <Badge tone={pnlTone(mtm)}>{formatCurrency(mtm)}</Badge>}</td>
+                    <td className="px-3 py-2 text-right">{p.buy_quantity}</td>
+                    <td className="px-3 py-2">{formatCurrency(p.avg_buy_price)}</td>
+                    <td className="px-3 py-2 text-right">{p.sell_quantity}</td>
+                    <td className="px-3 py-2">{formatCurrency(p.avg_sell_price)}</td>
                     <td className="px-3 py-2">
                       <div className="flex gap-1">
                         <button disabled={isZero} title="Increase position" onClick={() => openAction('increase', p)} className={`rounded border border-aveon-border px-2 py-1 text-aveon-buy hover:bg-aveon-panel2 ${isZero ? 'opacity-50 cursor-not-allowed' : ''}`}>Increase</button>
@@ -266,11 +365,40 @@ export default function PositionsPage() {
         />
       )}
 
+      {closeSelectedOpen && (
+        <div className="fixed inset-0 z-[2147483647] flex items-center justify-center bg-black/65 p-4">
+          <div className="w-full max-w-lg rounded-xl border border-aveon-border bg-aveon-panel p-5 shadow-2xl">
+            <h3 className="text-sm font-semibold">Close selected positions?</h3>
+            <p className="mt-2 text-xs leading-5 text-aveon-muted">Choose the order type and validity. Limit prices are entered separately for each selected instrument.</p>
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              <label className="text-[11px] text-aveon-muted">Order Type
+                <select value={closeSelectedOrderType} onChange={(e) => setCloseSelectedOrderType(e.target.value as "RL-MKT" | "RL")} className="mt-1 w-full rounded-lg border border-aveon-border bg-aveon-panel2 px-3 py-2 text-sm text-aveon-text">
+                  <option value="RL-MKT">Market</option><option value="RL">Limit</option>
+                </select>
+              </label>
+              <label className="text-[11px] text-aveon-muted">Validity
+                <select value={closeSelectedValidity} onChange={(e) => setCloseSelectedValidity(e.target.value as "DAY" | "IOC")} className="mt-1 w-full rounded-lg border border-aveon-border bg-aveon-panel2 px-3 py-2 text-sm text-aveon-text">
+                  <option value="DAY">Day</option><option value="IOC">IOC</option>
+                </select>
+              </label>
+            </div>
+            <div className="mt-3 max-h-64 space-y-2 overflow-auto rounded-lg border border-aveon-border p-3">
+              {selectedRows.map(({ p, ltp, selectionKey }) => <div key={selectionKey} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-aveon-border/60 pb-2 last:border-0 last:pb-0 text-xs"><div><div className="font-medium">{positionDisplaySymbol(p)} <span className="text-aveon-muted">· {displayProductType(p.product_type, p.preferred_exchange || p.exchange, p.instrument)}</span></div><div className="mt-1 text-aveon-muted">{p.net_quantity > 0 ? "SELL" : "BUY"} {Math.abs(p.net_quantity)} · LTP {ltp > 0 ? formatCurrency(ltp) : "—"}</div></div>{closeSelectedOrderType === "RL" ? <label className="w-32 text-[10px] text-aveon-muted">Limit Price<input type="number" min="0.01" step="0.01" value={closeSelectedPrices[selectionKey] ?? ""} onChange={(e) => setCloseSelectedPrices((current) => ({ ...current, [selectionKey]: e.target.value }))} className="mt-1 w-full rounded-lg border border-aveon-border bg-aveon-panel2 px-2 py-1.5 text-xs text-aveon-text" placeholder="Enter price" /></label> : <span className="text-aveon-muted">Market</span>}</div>)}
+            </div>
+            <p className="mt-3 text-[11px] text-aveon-muted">Market orders use price 0.00; limit orders use the individual prices entered above. Please verify all quantities, sides and prices before confirming.</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <Button variant="ghost" disabled={busy} onClick={() => setCloseSelectedOpen(false)}>Cancel</Button>
+              <Button variant="sell" disabled={busy || selectedRows.length === 0 || (closeSelectedOrderType === "RL" && selectedRows.some(({ p }) => !(Number(closeSelectedPrices[positionSelectionKey(p)]) > 0)))} onClick={closeSelectedPositions}>{busy ? "Submitting…" : `Confirm Close ${selectedRows.length}`}</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {squareAllOpen && (
         <div className="fixed inset-0 z-[2147483647] flex items-center justify-center bg-black/65 p-4">
           <div className="w-full max-w-md rounded-xl border border-aveon-border bg-aveon-panel p-5 shadow-2xl">
             <h3 className="text-sm font-semibold">Square-off open positions?</h3>
-            <p className="mt-2 text-xs leading-5 text-aveon-muted">This sends the broker square-off request for all open positions in the selected view. The request creates market-side closing orders and cannot be undone from this screen.</p>
+            <p className="mt-2 text-xs leading-5 text-aveon-muted">Market closing orders will be sent to your broker for all open positions in this view. This action cannot be undone.</p>
             <div className="mt-4 flex justify-end gap-2">
               <Button variant="ghost" onClick={() => setSquareAllOpen(false)}>Cancel</Button>
               <Button variant="sell" disabled={busy} onClick={squareOffAll}>{busy ? 'Submitting…' : 'Confirm Square Off'}</Button>
@@ -387,6 +515,10 @@ function PositionActionDialog({
       </div>
     </div>
   );
+}
+
+function positionSelectionKey(p: PositionModel): string {
+  return [p.preferred_exchange || p.exchange, p.preferred_scrip_token ?? p.scrip_token, p.product_type, p.daily_or_expiry || ""].map((v) => String(v ?? "").trim().toUpperCase()).join("|");
 }
 
 function normalizePositionWeb(raw: Record<string, any>): PositionModel {

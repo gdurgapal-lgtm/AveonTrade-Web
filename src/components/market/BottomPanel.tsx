@@ -10,6 +10,7 @@ import { useMarketStream } from "@/hooks/useMarketStream";
 import { apiClient } from "@/lib/apiClient";
 import { orderBookPath, tradeBookPath, positionsPath, positionConversionInquiryPath, orderModifyPath, orderCancelPath, Endpoints } from "@/lib/endpoints";
 import { formatCurrency } from "@/lib/format";
+import { positionMtm } from "@/lib/positionHelpers";
 import { useLiveOrderStore } from "@/lib/liveOrderStore";
 import {
   normalizeHolding,
@@ -47,7 +48,7 @@ type ModifyState = { order: OrderModel; qty: number; price: string; trigger: str
 type ColumnDef = { key: string; label: string; minWidth: number; defaultVisible?: boolean };
 type ColumnPrefs = Record<Tab, string[]>;
 
-const RIGHT_ALIGNED_KEYS = new Set(["qty", "reqQty", "price", "trigger", "execQty", "execPrice", "netQty", "netPrice", "ltp", "netValue", "avgPrice", "currentValue", "pnl", "action"]);
+const RIGHT_ALIGNED_KEYS = new Set(["qty", "reqQty", "price", "trigger", "execQty", "execPrice", "netQty", "netPrice", "ltp", "netValue", "mtm", "buyQty", "buyPrice", "sellQty", "sellPrice", "avgPrice", "currentValue", "pnl", "action"]);
 const isRightAligned = (key: string) => RIGHT_ALIGNED_KEYS.has(key);
 
 const ACTION_BTN = "rounded border px-2.5 py-1 text-[11px] font-semibold leading-none transition-colors disabled:cursor-not-allowed disabled:opacity-50";
@@ -135,7 +136,10 @@ const COLUMN_DEFS: Record<Tab, ColumnDef[]> = {
   "Net Position": [
     { key: "symbol", label: "Symbol", minWidth: 165 }, { key: "product", label: "Product", minWidth: 120 },
     { key: "netQty", label: "Net Qty", minWidth: 85 }, { key: "netPrice", label: "Net Price", minWidth: 105 },
-    { key: "ltp", label: "LTP", minWidth: 105 }, { key: "netValue", label: "Net Value", minWidth: 115 },
+    { key: "netValue", label: "Net Value", minWidth: 115 }, { key: "ltp", label: "LTP", minWidth: 105 },
+    { key: "mtm", label: "MTM G/L", minWidth: 110 },
+    { key: "buyQty", label: "Buy Qty", minWidth: 85 }, { key: "buyPrice", label: "Buy Price", minWidth: 105 },
+    { key: "sellQty", label: "Sell Qty", minWidth: 85 }, { key: "sellPrice", label: "Sell Price", minWidth: 105 },
     { key: "action", label: "Action", minWidth: 210 },
   ],
   "DP Holding": [
@@ -647,18 +651,22 @@ export default function BottomPanel() {
   }
   function cellForPosition(p: PositionModel, key: string) {
     const isZero = p.net_quantity === 0;
+    const instrument = positionFeedInstrument(p);
+    const quoteKey = instrument ? feedToken(instrument) : null;
+    const ltp = quoteKey ? Number(positionQuotes[quoteKey]?.ltp) : 0;
+    const mtm = positionMtm(p, ltp);
     switch (key) {
       case "symbol": return <>{positionDisplaySymbol(p)}<span className="ml-1.5 font-normal text-aveon-muted">{p.preferred_exchange || p.exchange}</span></>;
       case "product": return displayProductType(p.product_type, p.preferred_exchange || p.exchange, p.instrument);
       case "netQty": return p.net_quantity;
       case "netPrice": return formatCurrency(p.net_price || (p.net_quantity >= 0 ? p.avg_buy_price : p.avg_sell_price));
-      case "ltp": {
-        const instrument = positionFeedInstrument(p);
-        const key = instrument ? feedToken(instrument) : null;
-        const ltp = key ? Number(positionQuotes[key]?.ltp) : 0;
-        return ltp > 0 ? formatCurrency(ltp) : "—";
-      }
+      case "ltp": return ltp > 0 ? formatCurrency(ltp) : "—";
       case "netValue": return <span className={signedTextClass(p.net_value)}>{formatCurrency(p.net_value)}</span>;
+      case "mtm": return mtm == null ? "—" : <span className={signedTextClass(mtm)}>{formatCurrency(mtm)}</span>;
+      case "buyQty": return p.buy_quantity;
+      case "buyPrice": return formatCurrency(p.avg_buy_price);
+      case "sellQty": return p.sell_quantity;
+      case "sellPrice": return formatCurrency(p.avg_sell_price);
       case "action": return (
         <div className="flex justify-end gap-1.5">
           <button disabled={isZero} title="Increase position" onClick={() => openPositionAction("increase", p)} className={`${ACTION_BTN_BUY} ${isZero ? "opacity-50 cursor-not-allowed" : ""}`}>Increase</button>
