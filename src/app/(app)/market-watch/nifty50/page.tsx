@@ -2,22 +2,29 @@
 
 import { useState, useEffect, useMemo, useRef } from "react";
 import { Card, Badge } from "@/components/ui/Primitives";
-import { NIFTY_50_CONSTITUENTS, NiftyConstituent } from "@/data/nifty50";
-import { TrendingUp, TrendingDown, ArrowUpDown, Loader2, BarChart3, Filter } from "lucide-react";
+import { PREDEFINED_WATCHLIST_GROUPS, PredefinedWatchlistGroup, WatchlistConstituent } from "@/data/predefinedWatchlists";
+import { TrendingUp, TrendingDown, ArrowUpDown, Loader2, BarChart3, Filter, Layers } from "lucide-react";
 import { useMarketStream } from "@/hooks/useMarketStream";
 import { normalizeInstrument, feedToken, exchangeSegmentFor, isIndexInstrument, type Instrument, type ProductType, type TransactionType, type OrderKind } from "@/types/trading";
 import OrderTicketModal from "@/components/market/OrderTicketModal";
 import TradingShortcutModal, { type TradingShortcutPanel } from "@/components/market/TradingShortcutModal";
 
-interface ResolvedNiftyConstituent extends NiftyConstituent {
+interface ResolvedConstituent extends WatchlistConstituent {
   instrument?: Instrument;
   restLtp?: number;
   restChange?: number;
   restChangePercent?: number;
   loading: boolean;
+  ltp?: number;
+  change?: number;
+  changePercent?: number;
+  prevClose?: number;
+  live?: boolean;
+  pts?: number;
+  weight?: number;
 }
 
-const NIFTY_CACHE_KEY = "aveontrade.nifty50.token.cache.v1";
+const CACHE_PREFIX = "aveontrade.analyzer.cache.";
 type SortKey = "symbol" | "sector" | "ltp" | "changePercent" | "weightage" | "estPoints";
 
 // --- Reconciliation / feed-health tuning -----------------------------------
@@ -46,12 +53,17 @@ function derivePrevClose(quote: any, ltp: number): number {
 }
 
 export default function Nifty50AnalyzerPage() {
+  const [selectedGroupId, setSelectedGroupId] = useState<string>("nifty50");
   const [searchTerm, setSearchTerm] = useState("");
   const [selectedSector, setSelectedSector] = useState("ALL");
   const [sortKey, setSortKey] = useState<SortKey>("weightage");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
-  const [resolvedConstituents, setResolvedConstituents] = useState<ResolvedNiftyConstituent[]>([]);
+  const [resolvedConstituents, setResolvedConstituents] = useState<ResolvedConstituent[]>([]);
   const [resolving, setResolving] = useState(true);
+
+  const activeGroup = useMemo(() => {
+    return PREDEFINED_WATCHLIST_GROUPS.find((g) => g.id === selectedGroupId) || PREDEFINED_WATCHLIST_GROUPS[0];
+  }, [selectedGroupId]);
 
   // Keyboard navigation & container refs
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
@@ -66,7 +78,7 @@ export default function Nifty50AnalyzerPage() {
   const [shortcutPanel, setShortcutPanel] = useState<TradingShortcutPanel | null>(null);
   const [cashPair, setCashPair] = useState<Instrument[]>([]);
 
-  // NIFTY 50 index instrument (previous close + live value come from the feed, not a constant)
+  // Index instrument (previous close + live value come from the feed)
   const [indexInstrument, setIndexInstrument] = useState<Instrument | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [orderTick, setOrderTick] = useState(0);
@@ -77,30 +89,32 @@ export default function Nifty50AnalyzerPage() {
   const lastIdxQuoteRef = useRef<unknown>(null);
   const gapWarnRef = useRef(false);
 
-  // Instant local cache loading with background differential synchronization
+  // Instant local cache loading with background differential synchronization for selected watchlist group
   useEffect(() => {
     let cancelled = false;
 
     async function initializeScrips() {
       setResolving(true);
+      const cacheKey = `${CACHE_PREFIX}${activeGroup.id}.v1`;
       let cachedMap: Record<string, Instrument> = {};
       
       try {
-        const rawCache = window.localStorage.getItem(NIFTY_CACHE_KEY);
+        const rawCache = window.localStorage.getItem(cacheKey);
         if (rawCache) {
           cachedMap = JSON.parse(rawCache);
         }
       } catch (err) {
-        console.error("Failed to parse Nifty 50 local cache:", err);
+        console.error("Failed to parse local cache:", err);
       }
 
-      const missingSymbols = NIFTY_50_CONSTITUENTS.filter((item) => !cachedMap[item.symbol]);
+      const missingItems = activeGroup.items.filter((item) => !cachedMap[item.symbol]);
 
-      if (missingSymbols.length === 0 && Object.keys(cachedMap).length > 0) {
-        const initialList = NIFTY_50_CONSTITUENTS.map((item) => ({
+      if (missingItems.length === 0 && Object.keys(cachedMap).length > 0) {
+        const initialList = activeGroup.items.map((item) => ({
           ...item,
           instrument: cachedMap[item.symbol],
           loading: false,
+          ltp: 0, change: 0, changePercent: 0, prevClose: 0, live: false, pts: 0, weight: item.weightage ?? 0
         }));
         if (!cancelled) {
           setResolvedConstituents(initialList);
@@ -110,10 +124,11 @@ export default function Nifty50AnalyzerPage() {
       }
 
       if (Object.keys(cachedMap).length > 0) {
-        const partialList = NIFTY_50_CONSTITUENTS.map((item) => ({
+        const partialList = activeGroup.items.map((item) => ({
           ...item,
           instrument: cachedMap[item.symbol],
           loading: !cachedMap[item.symbol],
+          ltp: 0, change: 0, changePercent: 0, prevClose: 0, live: false, pts: 0, weight: item.weightage ?? 0
         }));
         if (!cancelled) {
           setResolvedConstituents(partialList);
@@ -123,7 +138,7 @@ export default function Nifty50AnalyzerPage() {
 
       const newlyResolved = { ...cachedMap };
       await Promise.all(
-        missingSymbols.map(async (item) => {
+        missingItems.map(async (item) => {
           try {
             const res = await fetch(`/api/broker/scrip-lookup?q=${encodeURIComponent(item.symbol)}`, { credentials: "include" });
             const json = await res.json();
@@ -132,8 +147,9 @@ export default function Nifty50AnalyzerPage() {
             const match = rawHit?._source || rawHit;
 
             if (match) {
-              const inst = normalizeInstrument(match);
+              const inst = normalizeInstrument(match) as Instrument & { sector?: string; companyName?: string };
               inst.companyName = item.companyName;
+              inst.sector = item.sector;
               if (!inst.symbol) inst.symbol = item.symbol;
               if (!inst.tradingSymbol) inst.tradingSymbol = item.symbol;
               newlyResolved[item.symbol] = inst;
@@ -145,16 +161,17 @@ export default function Nifty50AnalyzerPage() {
       );
 
       try {
-        window.localStorage.setItem(NIFTY_CACHE_KEY, JSON.stringify(newlyResolved));
+        window.localStorage.setItem(cacheKey, JSON.stringify(newlyResolved));
       } catch (err) {
-        console.error("Failed to save Nifty 50 token cache:", err);
+        console.error("Failed to save token cache:", err);
       }
 
       if (!cancelled) {
-        const updatedList = NIFTY_50_CONSTITUENTS.map((item) => ({
+        const updatedList = activeGroup.items.map((item) => ({
           ...item,
           instrument: newlyResolved[item.symbol],
           loading: false,
+          ltp: 0, change: 0, changePercent: 0, prevClose: 0, live: false, pts: 0, weight: item.weightage ?? 0
         }));
         setResolvedConstituents(updatedList);
         setResolving(false);
@@ -165,20 +182,31 @@ export default function Nifty50AnalyzerPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [activeGroup]);
 
-  // Resolve the NIFTY 50 index itself (same lookup approach as MarketIndexStrip)
+  // Resolve Index instrument corresponding to the selected group
   useEffect(() => {
     let cancelled = false;
+    const queryMap: Record<string, string[]> = {
+      nifty50: ["NIFTY 50", "NIFTY"],
+      "nifty-bank": ["NIFTY BANK", "BANKNIFTY"],
+      "nifty-finance": ["NIFTY FIN SERVICE", "FINNIFTY"],
+      "nifty-auto": ["NIFTY AUTO"],
+      "nifty-fmcg": ["NIFTY FMCG"],
+      "nifty-india-def": ["NIFTY INDIA DEFENCE", "NIFTY DEFENCE"],
+      "nifty-pharma": ["NIFTY PHARMA"]
+    };
+    const queries = queryMap[activeGroup.id] || [activeGroup.name];
+
     (async () => {
-      for (const q of ["NIFTY 50", "NIFTY"]) {
+      for (const q of queries) {
         try {
           const res = await fetch(`/api/broker/scrip-lookup?q=${encodeURIComponent(q)}`, { credentials: "include" });
           const json = await res.json();
           const hits = json?.data?.result?.hits?.hits ?? json?.data?.hits?.hits ?? [];
           const candidates: Instrument[] = hits.map((hit: Record<string, unknown>) => normalizeInstrument(hit));
           const found = candidates.find(
-            (i) => i.isIndex && i.token && ["NIFTY", "NIFTY50"].includes(compactUpper(i.tradingSymbol || i.symbol || ""))
+            (i) => i.isIndex && i.token
           );
           if (found) {
             if (!cancelled) setIndexInstrument(found);
@@ -188,9 +216,10 @@ export default function Nifty50AnalyzerPage() {
           /* try next query */
         }
       }
+      if (!cancelled) setIndexInstrument(null);
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [activeGroup]);
 
   // 1s clock: feed-age display + throttled re-sorting of live columns
   useEffect(() => {
@@ -212,7 +241,7 @@ export default function Nifty50AnalyzerPage() {
 
   const { quotes, quotesByToken, connected } = useMarketStream(instrumentsList, activeOrderInstrument, cashPair);
 
-  // Index quote: previous close + live value (index ticks arrive far faster than stock ticks)
+  // Index quote: previous close + live value
   const indexQuote = indexInstrument ? quotesByToken[feedToken(indexInstrument) ?? ""] : undefined;
   const idxLtp = Number(indexQuote?.ltp) || 0;
   const idxPrev = derivePrevClose(indexQuote, idxLtp);
@@ -230,7 +259,7 @@ export default function Nifty50AnalyzerPage() {
     }
   }, [indexQuote]);
 
-  // Stamp the arrival time of each constituent's quote (identity changes only when a tick is applied)
+  // Stamp the arrival time of each constituent's quote
   useEffect(() => {
     const t = Date.now();
     for (const c of resolvedConstituents) {
@@ -259,25 +288,23 @@ export default function Nifty50AnalyzerPage() {
         (inst?.symbol ? quotes[inst.symbol] : undefined) ||
         quotes[c.symbol];
 
-      // Only a real traded price counts as live; never substitute close for ltp
       const ltp = Number(quote?.ltp) || 0;
       const prevClose = derivePrevClose(quote, ltp);
       const change = ltp > 0 && prevClose > 0 ? ltp - prevClose : 0;
       const changePercent = prevClose > 0 ? (change / prevClose) * 100 : 0;
       const live = ltp > 0 && prevClose > 0;
-      // k = index points per Rs 1 move. It is a calibrated constant (data/nifty50.ts) that stays valid between
-      // rebalances; a stock without one (seed weight only) is calibrated here from its seed weight and live prev close.
-      const k = c.indexPtsPerRupee ?? (indexReady && prevClose > 0 ? (c.weightage * idxPrev) / prevClose : 0);
-      const pts = live ? k * change : 0;
-      const weight = live && idxLtp > 0 && k > 0 ? (k * ltp) / idxLtp : c.weightage; // live weight, like exchange tables
+      
+      const seedWeight = c.weightage ?? (1 / resolvedConstituents.length);
+      const pts = live ? seedWeight * change * (idxLtp / (idxPrev || 1)) : 0;
+      const weight = seedWeight;
 
       return { ...c, ltp, change, changePercent, prevClose, live, pts, weight };
     });
-  }, [resolvedConstituents, quotes, quotesByToken, idxPrev, idxLtp, indexReady]);
+  }, [resolvedConstituents, quotes, quotesByToken, idxPrev, idxLtp]);
 
   const sectors = useMemo(() => {
-    return ["ALL", ...Array.from(new Set(NIFTY_50_CONSTITUENTS.map((c) => c.sector)))];
-  }, []);
+    return ["ALL", ...Array.from(new Set(activeGroup.items.map((c) => c.sector)))];
+  }, [activeGroup]);
 
   // Calculate sector-wise performance attribution
   const sectorAttribution = useMemo(() => {
@@ -296,8 +323,7 @@ export default function Nifty50AnalyzerPage() {
       .sort((a, b) => b.netPoints - a.netPoints);
   }, [liveData]);
 
-  // Row ORDER is decided from a snapshot that refreshes every few seconds (and is paused while the
-  // mouse is over the table), so rows don't jump under the cursor next to BUY/SELL. Values stay live.
+  // Row ORDER snapshot management
   const liveRef = useRef(liveData);
   liveRef.current = liveData;
   const orderedSymbols = useMemo(() => {
@@ -316,17 +342,16 @@ export default function Nifty50AnalyzerPage() {
       let valB: string | number = 0;
       if (sortKey === "symbol") { valA = a.symbol; valB = b.symbol; }
       else if (sortKey === "sector") { valA = a.sector; valB = b.sector; }
-      else if (sortKey === "ltp") { valA = a.ltp; valB = b.ltp; }
-      else if (sortKey === "changePercent") { valA = a.changePercent; valB = b.changePercent; }
-      else if (sortKey === "weightage") { valA = a.weight; valB = b.weight; }
-      else if (sortKey === "estPoints") { valA = a.pts; valB = b.pts; }
+      else if (sortKey === "ltp") { valA = a.ltp!; valB = b.ltp!; }
+      else if (sortKey === "changePercent") { valA = a.changePercent!; valB = b.changePercent!; }
+      else if (sortKey === "weightage") { valA = a.weight!; valB = b.weight!; }
+      else if (sortKey === "estPoints") { valA = a.pts!; valB = b.pts!; }
       if (typeof valA === "string" && typeof valB === "string") {
         return sortOrder === "asc" ? valA.localeCompare(valB) : valB.localeCompare(valA);
       }
       return sortOrder === "asc" ? (valA as number) - (valB as number) : (valB as number) - (valA as number);
     });
     return list.map((c) => c.symbol);
-    // liveData.length: re-run once constituents load; orderTick: periodic refresh
   }, [orderTick, liveData.length, searchTerm, selectedSector, sortKey, sortOrder]);
 
   const filteredAndSorted = useMemo(() => {
@@ -334,10 +359,9 @@ export default function Nifty50AnalyzerPage() {
     return orderedSymbols.map((s) => bySymbol.get(s)).filter((c): c is NonNullable<typeof c> => !!c);
   }, [orderedSymbols, liveData]);
 
-  // Selection follows the SYMBOL, not a row position, so F1/F2 never hit a different stock after a re-sort
   const selectedIndex = Math.max(0, filteredAndSorted.findIndex((c) => c.symbol === selectedSymbol));
 
-  // Keep active order instrument synced & scroll strictly within container without sticky header overlap
+  // Keep active order instrument synced & scroll strictly within container
   useEffect(() => {
     if (filteredAndSorted.length > 0) {
       const target = filteredAndSorted[selectedIndex] || filteredAndSorted[0];
@@ -363,7 +387,7 @@ export default function Nifty50AnalyzerPage() {
   }, [selectedIndex, filteredAndSorted]);
 
   // Trigger local order ticket modal
-  const handleOpenOrderTicket = (constituent: ResolvedNiftyConstituent, side: TransactionType) => {
+  const handleOpenOrderTicket = (constituent: ResolvedConstituent, side: TransactionType) => {
     if (constituent.instrument) {
       if (isIndexInstrument(constituent.instrument)) {
         window.alert("Indices Instruments are non-tradable");
@@ -428,23 +452,22 @@ export default function Nifty50AnalyzerPage() {
     return () => window.removeEventListener("keydown", handleHotkeys);
   }, [activeOrderInstrument, filteredAndSorted, selectedIndex, shortcutPanel, orderEntryOpen]);
 
-  const estimatedIndexPoints = liveData.reduce((acc, c) => acc + c.pts, 0); // net contribution
-  const totalWeightedChange = indexReady ? (estimatedIndexPoints / idxPrev) * 100 : 0; // as % of the index
-  const positivePoints = liveData.reduce((acc, c) => acc + (c.pts > 0 ? c.pts : 0), 0);
-  const negativePoints = liveData.reduce((acc, c) => acc + (c.pts < 0 ? c.pts : 0), 0);
-  const pullersCount = liveData.filter((c) => c.pts > 0).length;
-  const draggersCount = liveData.filter((c) => c.pts < 0).length;
+  const estimatedIndexPoints = liveData.reduce((acc, c) => acc + (c.pts ?? 0), 0);
+  const totalWeightedChange = indexReady ? (estimatedIndexPoints / idxPrev) * 100 : 0;
+  const positivePoints = liveData.reduce((acc, c) => acc + ((c.pts ?? 0) > 0 ? (c.pts ?? 0) : 0), 0);
+  const negativePoints = liveData.reduce((acc, c) => acc + ((c.pts ?? 0) < 0 ? (c.pts ?? 0) : 0), 0);
+  const pullersCount = liveData.filter((c) => (c.pts ?? 0) > 0).length;
+  const draggersCount = liveData.filter((c) => (c.pts ?? 0) < 0).length;
   const liveCount = liveData.filter((c) => c.live).length;
-  const totalCount = NIFTY_50_CONSTITUENTS.length;
+  const totalCount = activeGroup.items.length;
 
-  // Index as it was ~STOCK_LAG_MS ago, to line up with 1s stock ticks (falls back to the live value)
   const idxAligned =
     [...idxBufRef.current].reverse().find((x) => x.t <= now - STOCK_LAG_MS)?.ltp ?? idxLtp;
   const actualPoints = indexReady ? idxLtp - idxPrev : 0;
   const actualPointsAligned = indexReady ? idxAligned - idxPrev : 0;
   const residual = actualPointsAligned - estimatedIndexPoints;
   const residualRaw = actualPoints - estimatedIndexPoints;
-  // Hysteresis: turn on above WARN, turn off only below CLEAR, so a gap hovering near the limit doesn't flicker
+  
   if (!indexReady) gapWarnRef.current = false;
   else if (Math.abs(residual) > RESIDUAL_WARN_PTS) gapWarnRef.current = true;
   else if (Math.abs(residual) < RESIDUAL_CLEAR_PTS) gapWarnRef.current = false;
@@ -463,15 +486,15 @@ export default function Nifty50AnalyzerPage() {
 
   const topPullers = useMemo(() => {
     return [...liveData]
-      .filter((c) => c.changePercent > 0)
-      .sort((a, b) => b.pts - a.pts)
+      .filter((c) => (c.changePercent ?? 0) > 0)
+      .sort((a, b) => (b.pts ?? 0) - (a.pts ?? 0))
       .slice(0, 4);
   }, [liveData]);
 
   const topDraggers = useMemo(() => {
     return [...liveData]
-      .filter((c) => c.changePercent < 0)
-      .sort((a, b) => a.pts - b.pts)
+      .filter((c) => (c.changePercent ?? 0) < 0)
+      .sort((a, b) => (a.pts ?? 0) - (b.pts ?? 0))
       .slice(0, 4);
   }, [liveData]);
 
@@ -491,8 +514,21 @@ export default function Nifty50AnalyzerPage() {
       {/* Compact Header & Terminal Telemetry */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between shrink-0 pb-1">
         <div className="flex items-center gap-3">
-          <h1 className="text-sm font-bold tracking-tight text-aveon-text font-mono">NIFTY 50 INDEX ANALYZER</h1>
-          <div className="text-[10px] px-2 py-0.5 rounded font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-mono">CAP-WEIGHTED</div>
+          <div className="flex items-center gap-2">
+            <Layers size={16} className="text-aveon-primary" />
+            <select
+              value={selectedGroupId}
+              onChange={(e) => { setSelectedGroupId(e.target.value); setSearchTerm(""); setSelectedSector("ALL"); setSelectedSymbol(null); }}
+              className="bg-aveon-panel text-aveon-text font-mono font-bold text-sm px-3 py-1.5 rounded-md border border-aveon-border outline-none focus:border-aveon-primary cursor-pointer shadow-sm"
+            >
+              {PREDEFINED_WATCHLIST_GROUPS.map((group) => (
+                <option key={group.id} value={group.id} className="bg-aveon-panel2 text-aveon-text">
+                  {group.name} 
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="text-[10px] px-2 py-0.5 rounded font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-mono hidden sm:block">CAP-WEIGHTED</div>
         </div>
 
         <div className="flex items-center gap-3">
@@ -526,7 +562,7 @@ export default function Nifty50AnalyzerPage() {
                 )}
               </>
             ) : (
-              <div className="text-xs px-2.5 py-1 rounded font-semibold border border-aveon-border text-aveon-muted bg-aveon-panel">WAITING FOR NIFTY INDEX QUOTE</div>
+              <div className="text-xs px-2.5 py-1 rounded font-semibold border border-aveon-border text-aveon-muted bg-aveon-panel">WAITING FOR INDEX QUOTE</div>
             )}
           </div>
         </div>
@@ -535,7 +571,7 @@ export default function Nifty50AnalyzerPage() {
       {resolving && resolvedConstituents.length === 0 ? (
         <Card className="flex flex-col items-center justify-center p-20 bg-aveon-panel border-aveon-border shadow-sm">
           <Loader2 size={32} className="animate-spin text-aveon-primary mb-3" />
-          <p className="text-xs font-semibold text-aveon-text font-mono">Loading Nifty 50 Scrip Master from Local Cache...</p>
+          <p className="text-xs font-semibold text-aveon-text font-mono">Loading {activeGroup.name} Scrip Master from Local Cache...</p>
         </Card>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-start flex-1 min-h-0">
@@ -547,7 +583,7 @@ export default function Nifty50AnalyzerPage() {
             <div className="flex flex-col sm:flex-row items-center justify-between gap-3 bg-aveon-panel p-2.5 rounded-lg border border-aveon-border shadow-sm shrink-0">
               <input
                 type="text"
-                placeholder="Search symbol (e.g. RELIANCE, HDFCBANK)..."
+                placeholder={`Search ${activeGroup.name} symbol (e.g. RELIANCE, HDFCBANK)...`}
                 value={searchTerm}
                 onChange={(e) => { setSearchTerm(e.target.value); setSelectedSymbol(null); }}
                 className="w-full sm:w-64 rounded-md border border-aveon-border bg-aveon-panel2 text-aveon-text px-3 py-1.5 text-xs font-mono outline-none focus:border-aveon-primary placeholder:text-aveon-muted shadow-sm"
@@ -600,9 +636,13 @@ export default function Nifty50AnalyzerPage() {
                   </thead>
                   <tbody className="font-mono divide-y divide-aveon-border/40">
                     {filteredAndSorted.map((c, i) => {
-                      const pts = c.pts;
-                      const isPositive = c.changePercent >= 0;
+                      const pts = c.pts ?? 0;
+                      const isPositive = (c.changePercent ?? 0) >= 0;
                       const isKeyboardSelected = i === selectedIndex;
+                      const ltpVal = c.ltp ?? 0;
+                      const changeVal = c.change ?? 0;
+                      const changePctVal = c.changePercent ?? 0;
+                      const weightVal = c.weight ?? 0;
                       return (
                         <tr
                           key={c.symbol}
@@ -619,27 +659,27 @@ export default function Nifty50AnalyzerPage() {
                             <div className="text-[10px] text-aveon-muted font-sans truncate max-w-[130px]">{c.companyName}</div>
                           </td>
                           <td className="px-3 py-2.5 text-aveon-muted text-[11px] font-sans truncate max-w-[110px]">{c.sector}</td>
-                          <td className={`px-3 py-2.5 text-right font-bold text-sm ${c.ltp > 0 ? (isPositive ? "text-emerald-400" : "text-rose-400") : "text-aveon-text"}`}>
-                            {c.ltp > 0 ? `₹${c.ltp.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}
+                          <td className={`px-3 py-2.5 text-right font-bold text-sm ${ltpVal > 0 ? (isPositive ? "text-emerald-400" : "text-rose-400") : "text-aveon-text"}`}>
+                            {ltpVal > 0 ? `₹${ltpVal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}
                           </td>
                           <td className={`px-3 py-2.5 text-right font-bold text-sm ${isPositive ? "text-emerald-400" : "text-rose-400"}`}>
-                            {c.ltp > 0 ? (
+                            {ltpVal > 0 ? (
                               <div className="flex flex-col items-end">
-                                <span>{isPositive ? "+" : ""}₹{c.change.toFixed(2)}</span>
-                                <span className="text-[11px] font-semibold">({isPositive ? "+" : ""}{c.changePercent.toFixed(2)}%)</span>
+                                <span>{isPositive ? "+" : ""}₹{changeVal.toFixed(2)}</span>
+                                <span className="text-[11px] font-semibold">({isPositive ? "+" : ""}{changePctVal.toFixed(2)}%)</span>
                               </div>
                             ) : "—"}
                           </td>
                           <td className="px-3 py-2.5 text-right text-aveon-muted text-xs">
                             <div className="flex items-center justify-end gap-1.5">
-                              <span>{(c.weight * 100).toFixed(2)}%</span>
+                              <span>{(weightVal * 100).toFixed(2)}%</span>
                               <div className="w-8 bg-aveon-panel2 h-1.5 rounded-full overflow-hidden hidden sm:block">
-                                <div className="bg-aveon-primary h-full rounded-full" style={{ width: `${Math.min(100, (c.weight * 100) * 8)}%` }} />
+                                <div className="bg-aveon-primary h-full rounded-full" style={{ width: `${Math.min(100, (weightVal * 100) * 8)}%` }} />
                               </div>
                             </div>
                           </td>
                           <td className={`px-3 py-2.5 text-right font-bold text-sm ${pts >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
-                            {c.ltp > 0 ? `${pts >= 0 ? "+" : ""}${pts.toFixed(2)}` : "—"}
+                            {ltpVal > 0 ? `${pts >= 0 ? "+" : ""}${pts.toFixed(2)}` : "—"}
                           </td>
                           <td className="px-3 py-2.5 text-center" onClick={(e) => e.stopPropagation()}>
                             <div className="flex items-center justify-center gap-1">
@@ -684,7 +724,8 @@ export default function Nifty50AnalyzerPage() {
               <div className="space-y-1.5">
                 {topPullers.length > 0 ? (
                   topPullers.map((c, i) => {
-                    const pts = c.pts;
+                    const pts = c.pts ?? 0;
+                    const weightVal = c.weight ?? 0;
                     return (
                       <div key={i} className="flex items-center justify-between text-xs py-0.5 font-mono">
                         <div>
@@ -693,7 +734,7 @@ export default function Nifty50AnalyzerPage() {
                         </div>
                         <div className="text-right">
                           <div className="text-emerald-400 font-bold text-sm">+{pts.toFixed(2)} pts</div>
-                          <div className="text-[9px] text-aveon-muted">Wtg: {(c.weight * 100).toFixed(1)}%</div>
+                          <div className="text-[9px] text-aveon-muted">Wtg: {(weightVal * 100).toFixed(1)}%</div>
                         </div>
                       </div>
                     );
@@ -719,7 +760,8 @@ export default function Nifty50AnalyzerPage() {
               <div className="space-y-1.5">
                 {topDraggers.length > 0 ? (
                   topDraggers.map((c, i) => {
-                    const pts = c.pts;
+                    const pts = c.pts ?? 0;
+                    const weightVal = c.weight ?? 0;
                     return (
                       <div key={i} className="flex items-center justify-between text-xs py-0.5 font-mono">
                         <div>
@@ -728,7 +770,7 @@ export default function Nifty50AnalyzerPage() {
                         </div>
                         <div className="text-right">
                           <div className="text-rose-400 font-bold text-sm">{pts.toFixed(2)} pts</div>
-                          <div className="text-[9px] text-aveon-muted">Wtg: {(c.weight * 100).toFixed(1)}%</div>
+                          <div className="text-[9px] text-aveon-muted">Wtg: {(weightVal * 100).toFixed(1)}%</div>
                         </div>
                       </div>
                     );

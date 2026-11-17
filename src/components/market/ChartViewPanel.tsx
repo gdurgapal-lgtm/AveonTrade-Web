@@ -155,7 +155,7 @@ export default function ChartViewPanel({
   const [activeDrawingTool, setActiveDrawingTool] = useState<string | null>(null);
   const [clearDrawingsVersion, setClearDrawingsVersion] = useState(0);
   const [countdown, setCountdown] = useState<string>("");
-  const [showResearchSidebar, setShowResearchSidebar] = useState(true);
+  const [showResearchSidebar, setShowResearchSidebar] = useState(false);
   
   // Lifted research messages state so history persists across toggle / maximize / minimize
   const [researchMessages, setResearchMessages] = useState<Array<{ role: 'user' | 'assistant'; text: string }>>([]);
