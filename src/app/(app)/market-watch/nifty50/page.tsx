@@ -22,6 +22,7 @@ interface ResolvedConstituent extends WatchlistConstituent {
   live?: boolean;
   pts?: number;
   weight?: number;
+  hasPrice?: boolean;
 }
 
 const CACHE_PREFIX = "aveontrade.analyzer.cache.";
@@ -50,6 +51,24 @@ function derivePrevClose(quote: any, ltp: number): number {
   const change = Number(quote.change ?? quote.net_change) || 0;
   if (close > 0 && (Math.abs(close - ltp) > 1e-9 || change === 0)) return close;
   return change !== 0 ? ltp - change : close;
+}
+
+// --- Last-known price snapshots (used when the market is closed / feed is silent) ---
+const SNAP_KEY = "aveontrade.analyzer.lastprices.v1";
+type PriceSnap = { ltp: number; prevClose: number; t: number };
+
+/**
+ * Pick the best available price for a token:
+ * 1) live quote, 2) last live snapshot saved in this browser, 3) the quote's close price.
+ */
+function resolvePrice(quote: any, snap?: PriceSnap): { ltp: number; prevClose: number; live: boolean } {
+  const liveLtp = Number(quote?.ltp) || 0;
+  const livePrev = derivePrevClose(quote, liveLtp);
+  if (liveLtp > 0 && livePrev > 0) return { ltp: liveLtp, prevClose: livePrev, live: true };
+  if (snap && snap.ltp > 0 && snap.prevClose > 0) return { ltp: snap.ltp, prevClose: snap.prevClose, live: false };
+  const close = Number(quote?.close) || 0;
+  if (close > 0) return { ltp: liveLtp > 0 ? liveLtp : close, prevClose: close, live: false };
+  return { ltp: liveLtp, prevClose: 0, live: false };
 }
 
 export default function Nifty50AnalyzerPage() {
@@ -88,6 +107,9 @@ export default function Nifty50AnalyzerPage() {
   const idxBufRef = useRef<{ t: number; ltp: number }[]>([]);
   const lastIdxQuoteRef = useRef<unknown>(null);
   const gapWarnRef = useRef(false);
+  const snapRef = useRef<Record<string, PriceSnap>>({});
+  const snapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [snapReady, setSnapReady] = useState(false);
 
   // Instant local cache loading with background differential synchronization for selected watchlist group
   useEffect(() => {
@@ -242,9 +264,11 @@ export default function Nifty50AnalyzerPage() {
   const { quotes, quotesByToken, connected } = useMarketStream(instrumentsList, activeOrderInstrument, cashPair);
 
   // Index quote: previous close + live value
-  const indexQuote = indexInstrument ? quotesByToken[feedToken(indexInstrument) ?? ""] : undefined;
-  const idxLtp = Number(indexQuote?.ltp) || 0;
-  const idxPrev = derivePrevClose(indexQuote, idxLtp);
+  const indexToken = indexInstrument ? feedToken(indexInstrument) ?? "" : "";
+  const indexQuote = indexToken ? quotesByToken[indexToken] : undefined;
+  const idxPrice = resolvePrice(indexQuote, indexToken ? snapRef.current[indexToken] : undefined);
+  const idxLtp = idxPrice.ltp;
+  const idxPrev = idxPrice.prevClose;
   const indexReady = idxPrev > 0;
 
   // Keep a short history of index values so we can compare against the index "as of" the stock snapshot
@@ -274,6 +298,61 @@ export default function Nifty50AnalyzerPage() {
     }
   }, [quotesByToken, resolvedConstituents]);
 
+  // Load last-known prices saved in this browser (so a closed market still shows data)
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(SNAP_KEY);
+      if (raw) snapRef.current = JSON.parse(raw);
+    } catch (err) {
+      console.error("Failed to load last-price snapshots:", err);
+    }
+    setSnapReady(true);
+  }, []);
+
+  // Remember the latest live price + previous close per token; persist on a trailing 3s throttle
+  useEffect(() => {
+    const t = Date.now();
+    let changed = false;
+    const insts: (Instrument | null | undefined)[] = [...resolvedConstituents.map((c) => c.instrument), indexInstrument];
+    for (const inst of insts) {
+      if (!inst) continue;
+      const k = feedToken(inst);
+      if (!k) continue;
+      const q = quotesByToken[k];
+      const ltp = Number(q?.ltp) || 0;
+      const prevClose = derivePrevClose(q, ltp);
+      if (ltp > 0 && prevClose > 0) {
+        snapRef.current[k] = { ltp, prevClose, t };
+        changed = true;
+      }
+    }
+    if (changed && snapTimerRef.current === null) {
+      snapTimerRef.current = setTimeout(() => {
+        snapTimerRef.current = null;
+        try {
+          window.localStorage.setItem(SNAP_KEY, JSON.stringify(snapRef.current));
+        } catch {
+          /* storage full or unavailable */
+        }
+      }, 3000);
+    }
+  }, [quotesByToken, resolvedConstituents, indexInstrument]);
+
+  // Flush any pending snapshot write on unmount
+  useEffect(() => {
+    return () => {
+      if (snapTimerRef.current !== null) {
+        clearTimeout(snapTimerRef.current);
+        snapTimerRef.current = null;
+        try {
+          window.localStorage.setItem(SNAP_KEY, JSON.stringify(snapRef.current));
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+  }, []);
+
   // Map live streaming quotes by token and symbol; change is derived from previous close
   const liveData = useMemo(() => {
     return resolvedConstituents.map((c) => {
@@ -288,19 +367,21 @@ export default function Nifty50AnalyzerPage() {
         (inst?.symbol ? quotes[inst.symbol] : undefined) ||
         quotes[c.symbol];
 
-      const ltp = Number(quote?.ltp) || 0;
-      const prevClose = derivePrevClose(quote, ltp);
+      const price = resolvePrice(quote, tokenKey ? snapRef.current[tokenKey] : undefined);
+      const { ltp, prevClose } = price;
       const change = ltp > 0 && prevClose > 0 ? ltp - prevClose : 0;
       const changePercent = prevClose > 0 ? (change / prevClose) * 100 : 0;
-      const live = ltp > 0 && prevClose > 0;
+      const hasPrice = ltp > 0 && prevClose > 0; // live OR last-known/close price
+      const live = price.live;                     // true only when fed by a live tick
       
       const seedWeight = c.weightage ?? (1 / resolvedConstituents.length);
-      const pts = live ? seedWeight * change * (idxLtp / (idxPrev || 1)) : 0;
+      // Index points = weight (as of prev close) x stock % return x index prev close
+      const pts = hasPrice && idxPrev > 0 ? seedWeight * (changePercent / 100) * idxPrev : 0;
       const weight = seedWeight;
 
-      return { ...c, ltp, change, changePercent, prevClose, live, pts, weight };
+      return { ...c, ltp, change, changePercent, prevClose, live, hasPrice, pts, weight };
     });
-  }, [resolvedConstituents, quotes, quotesByToken, idxPrev, idxLtp]);
+  }, [resolvedConstituents, quotes, quotesByToken, idxPrev, idxLtp, snapReady]);
 
   const sectors = useMemo(() => {
     return ["ALL", ...Array.from(new Set(activeGroup.items.map((c) => c.sector)))];
@@ -459,6 +540,7 @@ export default function Nifty50AnalyzerPage() {
   const pullersCount = liveData.filter((c) => (c.pts ?? 0) > 0).length;
   const draggersCount = liveData.filter((c) => (c.pts ?? 0) < 0).length;
   const liveCount = liveData.filter((c) => c.live).length;
+  const pricedCount = liveData.filter((c) => c.hasPrice).length;
   const totalCount = activeGroup.items.length;
 
   const idxAligned =
@@ -471,7 +553,7 @@ export default function Nifty50AnalyzerPage() {
   if (!indexReady) gapWarnRef.current = false;
   else if (Math.abs(residual) > RESIDUAL_WARN_PTS) gapWarnRef.current = true;
   else if (Math.abs(residual) < RESIDUAL_CLEAR_PTS) gapWarnRef.current = false;
-  const residualWarn = indexReady && (gapWarnRef.current || liveCount < totalCount);
+  const residualWarn = indexReady && (gapWarnRef.current || pricedCount < totalCount);
 
   const lastTickAt = lastStockTickRef.current;
   const feedAgeSec = lastTickAt ? Math.max(0, now - lastTickAt) / 1000 : null;
@@ -482,6 +564,9 @@ export default function Nifty50AnalyzerPage() {
     : feedAgeSec > FEED_DELAYED_SEC ? "delayed"
     : "live";
   const feedDot = { caching: "bg-amber-500 animate-ping", disconnected: "bg-rose-500", stale: "bg-rose-500", delayed: "bg-amber-500", live: "bg-emerald-500 animate-pulse" }[feedState];
+  const showingLastClose = liveCount === 0 && pricedCount > 0 && feedState !== "caching";
+  const feedLabel = showingLastClose ? "LAST CLOSE" : feedState.toUpperCase();
+  const feedDotClass = showingLastClose ? "bg-slate-400" : feedDot;
   const fmtSigned = (v: number, d = 2) => `${v >= 0 ? "+" : ""}${v.toFixed(d)}`;
 
   const topPullers = useMemo(() => {
@@ -523,7 +608,7 @@ export default function Nifty50AnalyzerPage() {
             >
               {PREDEFINED_WATCHLIST_GROUPS.map((group) => (
                 <option key={group.id} value={group.id} className="bg-aveon-panel2 text-aveon-text">
-                  {group.name} 
+                  {group.name} ANALYZER
                 </option>
               ))}
             </select>
@@ -533,9 +618,9 @@ export default function Nifty50AnalyzerPage() {
 
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 bg-aveon-panel px-2.5 py-1 rounded-md border border-aveon-border" title={feedAgeSec !== null ? `Last constituent tick ${feedAgeSec.toFixed(0)}s ago` : "No constituent ticks yet"}>
-            <span className={`h-2 w-2 rounded-full ${feedDot}`} />
+            <span className={`h-2 w-2 rounded-full ${feedDotClass}`} />
             <span className="text-[11px] font-mono font-medium text-aveon-muted">
-              {feedState.toUpperCase()} {liveCount}/{totalCount}
+              {feedLabel} {showingLastClose ? pricedCount : liveCount}/{totalCount}
               {feedAgeSec !== null && feedState !== "caching" ? ` · ${feedAgeSec.toFixed(0)}s` : ""}
             </span>
           </div>
@@ -555,7 +640,7 @@ export default function Nifty50AnalyzerPage() {
                 {(residualWarn || GAP_ALWAYS_VISIBLE) && (
                   <div
                     className={`text-xs px-2.5 py-1 rounded font-semibold border ${residualWarn ? "bg-amber-500/15 text-amber-400 border-amber-500/30" : "bg-aveon-panel text-aveon-muted border-aveon-border"}`}
-                    title={`Index moved ${fmtSigned(actualPointsAligned)} pts but stocks explain ${fmtSigned(estimatedIndexPoints)}. Gap ${fmtSigned(residual)} pts (raw, unaligned: ${fmtSigned(residualRaw)}). ${liveCount < totalCount ? `${totalCount - liveCount} constituent(s) have no live price. ` : ""}Check weights and feed.`}
+                    title={`Index moved ${fmtSigned(actualPointsAligned)} pts but stocks explain ${fmtSigned(estimatedIndexPoints)}. Gap ${fmtSigned(residual)} pts (raw, unaligned: ${fmtSigned(residualRaw)}). ${pricedCount < totalCount ? `${totalCount - pricedCount} constituent(s) have no price. ` : ""}Check weights and feed.`}
                   >
                     GAP {fmtSigned(residual)}
                   </div>
